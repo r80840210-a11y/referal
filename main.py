@@ -1,3 +1,4 @@
+import os
 import asyncio
 import sqlite3
 
@@ -9,11 +10,12 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
 # =========================
-# НАСТРОЙКИ
+# НАСТРОЙКИ (Переменные окружения)
 # =========================
 
-BOT_TOKEN = "ВСТАВЬ_ТОКЕН_БОТА_СЮДА"
-ADMIN_ID = 123456789  # Ваш Telegram ID
+# Читаем токен и ADMIN_ID из переменных окружения (из настроек Render)
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8877707155:AAGi6BMp6n09wQfRgLF6dxOyJ4P-4QVPkWo")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "6624873620"))  # Вставь свой Telegram ID вторым аргументом для тестов
 
 # =========================
 # БАЗА ДАННЫХ
@@ -155,7 +157,7 @@ async def users(call: CallbackQuery):
     await call.answer()
 
 # =========================
-# ДЕЙСТВИЯ АДМИНА (FSM)
+# ДЕЙСТВИЯ АДМИНА
 # =========================
 
 # 1. Выдача бонуса
@@ -217,7 +219,7 @@ async def process_broadcast(message: Message, state: FSMContext):
         try:
             await bot.send_message(user_id, message.text)
             sent += 1
-            await asyncio.sleep(0.05)  # Защита от лимитов Telegram API
+            await asyncio.sleep(0.05)
         except Exception:
             pass
 
