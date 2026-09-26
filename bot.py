@@ -34,7 +34,10 @@ db = {
     "users": {},               # user_id: {"game_id": str, "nickname": str, "balance": int, "referrer": int|None, "referrals_count": int}
     "banned": set(),           # Множество заблокированных user_id
     "withdraw_requests": {},   # req_id: {"user_id": int, "amount": int, "photo_id": str}
-    "promo_codes": {}          # code_name: {"reward": int, "activations": int, "used_by": set(user_ids)}
+    "promo_codes": {},         # code_name: {"reward": int, "activations": int, "used_by": set(user_ids)}
+    "stats": {
+        "total_paid_gold": 0   # Общая сумма успешно выплаченных GOLD
+    }
 }
 
 request_counter = 0
@@ -42,16 +45,14 @@ request_counter = 0
 async def process_referral_logic(user_id: int, user_first_name: str, referrer_id: int = None):
     """
     Проверяет, зарегистрирован ли пользователь.
-    Если это абсолютно новый пользователь и перешёл по ссылке — начисляет GOLD и шлёт уведомление.
+    Если это новый пользователь и перешел по ссылке — начисляет GOLD и шлет уведомление.
     """
     is_new_user = user_id not in db["users"]
     
     if is_new_user:
-        # Нельзя быть рефералом самого себя
         if referrer_id == user_id:
             referrer_id = None
             
-        # Проверяем, существует ли реферер в базе
         valid_referrer = referrer_id if (referrer_id and referrer_id in db["users"]) else None
 
         db["users"][user_id] = {
@@ -62,13 +63,11 @@ async def process_referral_logic(user_id: int, user_first_name: str, referrer_id
             "referrals_count": 0
         }
 
-        # Если пригласитель валиден — начисляем бонус
         if valid_referrer:
             db["users"][valid_referrer]["referrals_count"] += 1
             reward = config["ref_reward"]
             db["users"][valid_referrer]["balance"] += reward
             
-            # Отправляем мгновенное уведомление пригласителю
             try:
                 await bot.send_message(
                     valid_referrer,
@@ -168,7 +167,6 @@ async def cmd_start(message: types.Message, state: FSMContext):
     args = message.text.split()
     referrer_id = int(args[1]) if len(args) > 1 and args[1].isdigit() else None
     
-    # Обработка реферальной логики с защитой от двойного зачисления
     await process_referral_logic(
         user_id=message.from_user.id,
         user_first_name=message.from_user.first_name,
@@ -191,13 +189,19 @@ async def process_profile(message: types.Message):
     game_id = user["game_id"] if user["game_id"] else "Не указан"
     nickname = user["nickname"] if user["nickname"] else "Не указан"
     
+    total_users = len(db["users"])
+    total_paid = db["stats"]["total_paid_gold"]
+    
     text = (
         f"👤 **Профиль игрока**\n\n"
         f"🆔 Telegram ID: `{message.from_user.id}`\n"
         f"🎮 Игровой ID: `{game_id}`\n"
         f"🏷 Никнейм: `{nickname}`\n"
         f"💰 Баланс: **{user['balance']} GOLD**\n"
-        f"👥 Приглашено рефералов: **{user['referrals_count']}**"
+        f"👥 Приглашено рефералов: **{user['referrals_count']}**\n\n"
+        f"📊 **Статистика проекта:**\n"
+        f"👥 Всего пользователей в базе: **{total_users}**\n"
+        f"💎 Всего выплачено: **{total_paid} GOLD**"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💸 Вывести GOLD", callback_data="user_withdraw")],
@@ -361,10 +365,18 @@ async def process_admin_panel(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
         return await message.answer("⛔ У вас нет доступа!")
     
+    pending_gold = sum(r["amount"] for r in db["withdraw_requests"].values())
+    
     text = (
         f"🛠 **Панель Администратора**\n\n"
-        f"⚙️ Текущая награда за реферала: **{config['ref_reward']} GOLD**\n"
-        f"⚙️ Минимальная сумма вывода: **{config['min_withdraw']} GOLD**"
+        f"📊 **Статистика системы:**\n"
+        f"👥 Пользователей в базе: **{len(db['users'])}**\n"
+        f"🚫 Заблокировано: **{len(db['banned'])}**\n"
+        f"💎 Выплачено за всё время: **{db['stats']['total_paid_gold']} GOLD**\n"
+        f"⏳ На выводе сейчас: **{pending_gold} GOLD** ({len(db['withdraw_requests'])} заявок)\n"
+        f"🎟 Создано промокодов: **{len(db['promo_codes'])}**\n\n"
+        f"⚙️ Награда за реферала: **{config['ref_reward']} GOLD**\n"
+        f"⚙️ Мин. сумма вывода: **{config['min_withdraw']} GOLD**"
     )
     await message.answer(text, parse_mode="Markdown", reply_markup=get_admin_inline_keyboard())
 
@@ -452,6 +464,8 @@ async def process_buy_ok(callback: CallbackQuery):
     
     if req_id in db["withdraw_requests"]:
         req_data = db["withdraw_requests"].pop(req_id)
+        db["stats"]["total_paid_gold"] += req_data["amount"]
+        
         try:
             await bot.send_message(req_data["user_id"], f"✅ Ваша заявка на вывод **{req_data['amount']} GOLD** успешно выполнена (скин куплен)!", parse_mode="Markdown")
         except Exception:
@@ -630,14 +644,18 @@ async def start_web_server():
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', PORT)
     await site.start()
+    logging.info(f"Веб-сервер успешно запущен на порту {PORT}")
 
 # -------------------------------------------------------------------
 # ЗАПУСК
 # -------------------------------------------------------------------
 async def main():
-    await start_web_server()
-    logging.info(f"Веб-сервер запущен на порту {PORT}")
+    asyncio.create_task(start_web_server())
+    await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logging.info("Бот остановлен")
