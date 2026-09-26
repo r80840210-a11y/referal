@@ -39,18 +39,47 @@ db = {
 
 request_counter = 0
 
-def get_or_create_user(user_id: int, referrer_id: int = None):
-    if user_id not in db["users"]:
+async def process_referral_logic(user_id: int, user_first_name: str, referrer_id: int = None):
+    """
+    Проверяет, зарегистрирован ли пользователь.
+    Если это абсолютно новый пользователь и перешёл по ссылке — начисляет GOLD и шлёт уведомление.
+    """
+    is_new_user = user_id not in db["users"]
+    
+    if is_new_user:
+        # Нельзя быть рефералом самого себя
+        if referrer_id == user_id:
+            referrer_id = None
+            
+        # Проверяем, существует ли реферер в базе
+        valid_referrer = referrer_id if (referrer_id and referrer_id in db["users"]) else None
+
         db["users"][user_id] = {
             "game_id": None,
             "nickname": None,
             "balance": 0,
-            "referrer": referrer_id,
+            "referrer": valid_referrer,
             "referrals_count": 0
         }
-        if referrer_id and referrer_id in db["users"]:
-            db["users"][referrer_id]["referrals_count"] += 1
-            db["users"][referrer_id]["balance"] += config["ref_reward"]
+
+        # Если пригласитель валиден — начисляем бонус
+        if valid_referrer:
+            db["users"][valid_referrer]["referrals_count"] += 1
+            reward = config["ref_reward"]
+            db["users"][valid_referrer]["balance"] += reward
+            
+            # Отправляем мгновенное уведомление пригласителю
+            try:
+                await bot.send_message(
+                    valid_referrer,
+                    f"🔔 **Новый реферал!**\n\n"
+                    f"Пользователь **{user_first_name}** перешел по вашей ссылке.\n"
+                    f"Вам начислено **+{reward} GOLD**! 💰",
+                    parse_mode="Markdown"
+                )
+            except Exception:
+                pass
+                
     return db["users"][user_id]
 
 # -------------------------------------------------------------------
@@ -139,10 +168,12 @@ async def cmd_start(message: types.Message, state: FSMContext):
     args = message.text.split()
     referrer_id = int(args[1]) if len(args) > 1 and args[1].isdigit() else None
     
-    if referrer_id == message.from_user.id:
-        referrer_id = None
-
-    get_or_create_user(message.from_user.id, referrer_id)
+    # Обработка реферальной логики с защитой от двойного зачисления
+    await process_referral_logic(
+        user_id=message.from_user.id,
+        user_first_name=message.from_user.first_name,
+        referrer_id=referrer_id
+    )
     
     await message.answer(
         f"👋 Добро пожаловать, {message.from_user.first_name}!\n\n"
@@ -153,7 +184,10 @@ async def cmd_start(message: types.Message, state: FSMContext):
 # 👤 Профиль
 @dp.message(F.text == "👤 Профиль")
 async def process_profile(message: types.Message):
-    user = get_or_create_user(message.from_user.id)
+    user = db["users"].get(message.from_user.id)
+    if not user:
+        user = await process_referral_logic(message.from_user.id, message.from_user.first_name)
+        
     game_id = user["game_id"] if user["game_id"] else "Не указан"
     nickname = user["nickname"] if user["nickname"] else "Не указан"
     
@@ -189,9 +223,10 @@ async def process_bind_nickname(message: types.Message, state: FSMContext):
     game_id = data["game_id"]
     nickname = message.text
     
-    user = get_or_create_user(message.from_user.id)
-    user["game_id"] = game_id
-    user["nickname"] = nickname
+    user = db["users"].get(message.from_user.id)
+    if user:
+        user["game_id"] = game_id
+        user["nickname"] = nickname
     
     await state.clear()
     await message.answer(
@@ -202,7 +237,7 @@ async def process_bind_nickname(message: types.Message, state: FSMContext):
         reply_markup=get_main_keyboard(message.from_user.id)
     )
 
-# 🎟 Активация промокода пользователем
+# 🎟 Активация промокода
 @dp.callback_query(F.data == "user_promo")
 async def user_promo_start(callback: CallbackQuery, state: FSMContext):
     await state.set_state(Form.use_promo)
@@ -226,21 +261,20 @@ async def user_promo_process(message: types.Message, state: FSMContext):
     if promo["activations"] <= 0:
         return await message.answer("❌ Активации данного промокода закончились!")
 
-    # Применяем промокод
     promo["activations"] -= 1
     promo["used_by"].add(user_id)
     
-    user = get_or_create_user(user_id)
-    user["balance"] += promo["reward"]
+    user = db["users"].get(user_id)
+    if user:
+        user["balance"] += promo["reward"]
 
     await message.answer(f"🎉 Промокод `{code}` успешно активирован!\nВам зачислено **{promo['reward']} GOLD**.", parse_mode="Markdown")
 
 # 💸 Процесс Вывода средств
 @dp.callback_query(F.data == "user_withdraw")
 async def withdraw_start(callback: CallbackQuery, state: FSMContext):
-    user = get_or_create_user(callback.from_user.id)
-    
-    if not user["game_id"] or not user["nickname"]:
+    user = db["users"].get(callback.from_user.id)
+    if not user or not user["game_id"] or not user["nickname"]:
         await callback.answer("⚠️ Сначала привяжите игровой аккаунт!", show_alert=True)
         return
 
@@ -258,7 +292,7 @@ async def withdraw_amount_process(message: types.Message, state: FSMContext):
         return await message.answer("Введите число!")
     
     amount = int(message.text)
-    user = get_or_create_user(message.from_user.id)
+    user = db["users"].get(message.from_user.id)
     
     if amount < config["min_withdraw"]:
         return await message.answer(f"❌ Минимальная сумма вывода: {config['min_withdraw']} GOLD!")
@@ -276,7 +310,7 @@ async def withdraw_photo_process(message: types.Message, state: FSMContext):
     data = await state.get_data()
     amount = data["withdraw_amount"]
     
-    user = get_or_create_user(message.from_user.id)
+    user = db["users"].get(message.from_user.id)
     user["balance"] -= amount
     
     request_counter += 1
@@ -297,13 +331,13 @@ async def withdraw_photo_process(message: types.Message, state: FSMContext):
 async def process_ref_system(message: types.Message):
     bot_info = await bot.get_me()
     ref_link = f"https://t.me/{bot_info.username}?start={message.from_user.id}"
-    user = get_or_create_user(message.from_user.id)
+    user = db["users"].get(message.from_user.id)
     
     text = (
         f"🔗 **Реферальная система**\n\n"
         f"За каждого приглашенного друга вы получаете **{config['ref_reward']} GOLD**!\n\n"
         f"Ваша пригласительная ссылка:\n`{ref_link}`\n\n"
-        f"👥 Вы пригласили: **{user['referrals_count']}** чел."
+        f"👥 Вы пригласили: **{user['referrals_count'] if user else 0}** чел."
     )
     await message.answer(text, parse_mode="Markdown")
 
@@ -335,10 +369,9 @@ async def process_admin_panel(message: types.Message):
     await message.answer(text, parse_mode="Markdown", reply_markup=get_admin_inline_keyboard())
 
 # -------------------------------------------------------------------
-# АДМИН-ФУНКЦИИ & ПРОМОКОДЫ
+# АДМИН-ФУНКЦИИ & УПРАВЛЕНИЕ
 # -------------------------------------------------------------------
 
-# Создание промокода
 @dp.callback_query(F.data == "admin_create_promo")
 async def admin_promo_start(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id not in ADMIN_IDS: return
@@ -384,7 +417,6 @@ async def admin_promo_activations_process(message: types.Message, state: FSMCont
         parse_mode="Markdown"
     )
 
-# Просмотр заявок на вывод
 @dp.callback_query(F.data == "admin_requests")
 async def admin_requests_list(callback: CallbackQuery):
     if callback.from_user.id not in ADMIN_IDS: return
@@ -413,7 +445,6 @@ async def admin_requests_list(callback: CallbackQuery):
         
         await callback.message.answer_photo(photo=req_data["photo_id"], caption=caption, parse_mode="Markdown", reply_markup=kb)
 
-# Подтвердить покупку
 @dp.callback_query(F.data.startswith("buy_ok_"))
 async def process_buy_ok(callback: CallbackQuery):
     if callback.from_user.id not in ADMIN_IDS: return
@@ -428,7 +459,6 @@ async def process_buy_ok(callback: CallbackQuery):
         await callback.message.edit_caption(caption=callback.message.caption + "\n\n✅ **СТАТУС: КУПЛЕНО**")
     await callback.answer("Успешно!")
 
-# Отклонить покупку
 @dp.callback_query(F.data.startswith("buy_cancel_"))
 async def process_buy_cancel(callback: CallbackQuery):
     if callback.from_user.id not in ADMIN_IDS: return
@@ -444,7 +474,6 @@ async def process_buy_cancel(callback: CallbackQuery):
         await callback.message.edit_caption(caption=callback.message.caption + "\n\n❌ **СТАТУС: ОТКЛОНЕНО (GOLD возвращены)**")
     await callback.answer("Заявка отклонена!")
 
-# Изменение настроек
 @dp.callback_query(F.data == "admin_set_ref")
 async def admin_set_ref(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id not in ADMIN_IDS: return
@@ -473,7 +502,6 @@ async def admin_set_min_process(message: types.Message, state: FSMContext):
     await state.clear()
     await message.answer(f"✅ Минималка на вывод изменена на **{config['min_withdraw']} GOLD**.", parse_mode="Markdown")
 
-# Выдача бонуса
 @dp.callback_query(F.data == "admin_give_bonus")
 async def admin_give_bonus_start(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id not in ADMIN_IDS: return
@@ -495,7 +523,9 @@ async def admin_give_bonus_amount(message: types.Message, state: FSMContext):
     target_id = data["target_id"]
     amount = int(message.text)
     
-    user = get_or_create_user(target_id)
+    user = db["users"].get(target_id)
+    if not user:
+        user = await process_referral_logic(target_id, "User")
     user["balance"] += amount
     await state.clear()
     
@@ -505,7 +535,6 @@ async def admin_give_bonus_amount(message: types.Message, state: FSMContext):
         pass
     await message.answer(f"✅ Пользователю `{target_id}` начислено {amount} GOLD.", parse_mode="Markdown")
 
-# Бан / Разбан / Админы / Рассылка
 @dp.callback_query(F.data == "admin_ban")
 async def admin_ban_start(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id not in ADMIN_IDS: return
