@@ -20,17 +20,17 @@ from aiohttp import web
 # -------------------------------------------------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8877707155:AAGi6BMp6n09wQfRgLF6dxOyJ4P-4QVPkWo")
 
-# Список Telegram ID администраторов
+# Список Telegram ID администраторов (Ты — главный)
 ADMIN_IDS = [6624873620]
 
 # PORT для Render
 PORT = int(os.getenv("PORT", 10000))
 
 # -------------------------------------------------------------------
-# ИМИТАЦИЯ БАЗЫ ДАННЫХ (In-Memory)
+# БАЗА ДАННЫХ (In-Memory)
 # -------------------------------------------------------------------
 db = {
-    "users": {},      # user_id: {"game_id": str, "balance": int, "referrer": int|None, "referrals_count": int}
+    "users": {},      # user_id: {"game_id": str, "nickname": str, "balance": int, "referrer": int|None, "referrals_count": int}
     "banned": set()   # Множество заблокированных user_id
 }
 
@@ -38,28 +38,35 @@ def get_or_create_user(user_id: int, referrer_id: int = None):
     if user_id not in db["users"]:
         db["users"][user_id] = {
             "game_id": None,
+            "nickname": None,
             "balance": 0,
             "referrer": referrer_id,
             "referrals_count": 0
         }
         if referrer_id and referrer_id in db["users"]:
             db["users"][referrer_id]["referrals_count"] += 1
-            db["users"][referrer_id]["balance"] += 100  # Бонус за реферала
+            db["users"][referrer_id]["balance"] += 100
     return db["users"][user_id]
 
 # -------------------------------------------------------------------
 # FSM (Машина состояний)
 # -------------------------------------------------------------------
 class Form(StatesGroup):
-    bind_game_account = State()
+    # Привязка аккаунта в 2 шага
+    bind_game_id = State()
+    bind_nickname = State()
+    
+    # Админка
     admin_give_bonus_id = State()
     admin_give_bonus_amount = State()
     admin_ban_id = State()
     admin_unban_id = State()
+    admin_add_admin_id = State()
+    admin_remove_admin_id = State()
     admin_broadcast_msg = State()
 
 # -------------------------------------------------------------------
-# ИНИЦИАЛИЗАЦИЯ БОТА И ДИСПЕТЧЕРА
+# ИНИЦИАЛИЗАЦИЯ
 # -------------------------------------------------------------------
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=BOT_TOKEN)
@@ -82,11 +89,12 @@ def get_admin_inline_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🎁 Выдать бонус", callback_data="admin_give_bonus")],
         [InlineKeyboardButton(text="🚫 Забанить", callback_data="admin_ban"), InlineKeyboardButton(text="✅ Разбанить", callback_data="admin_unban")],
+        [InlineKeyboardButton(text="➕ Добавить админа", callback_data="admin_add_admin"), InlineKeyboardButton(text="➖ Удалить админа", callback_data="admin_remove_admin")],
         [InlineKeyboardButton(text="📢 Рассылка", callback_data="admin_broadcast")]
     ])
 
 # -------------------------------------------------------------------
-# ПРОВЕРКА НА БАН (MIDDLEWARE)
+# ПРОВЕРКА НА БАН
 # -------------------------------------------------------------------
 @dp.message.outer_middleware()
 async def check_ban_middleware(handler, event, data):
@@ -100,10 +108,9 @@ async def check_ban_middleware(handler, event, data):
     return await handler(event, data)
 
 # -------------------------------------------------------------------
-# ОБРАБОТЧИКИ КОМАНД И КНОПОК
+# ОБРАБОТЧИКИ (HANDLERS)
 # -------------------------------------------------------------------
 
-# /start
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message, state: FSMContext):
     await state.clear()
@@ -117,7 +124,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
     
     await message.answer(
         f"👋 Добро пожаловать, {message.from_user.first_name}!\n\n"
-        f"Используйте меню снизу для работы с ботом.",
+        f"Используйте кнопки меню ниже:",
         reply_markup=get_main_keyboard(message.from_user.id)
     )
 
@@ -125,35 +132,52 @@ async def cmd_start(message: types.Message, state: FSMContext):
 @dp.message(F.text == "👤 Профиль")
 async def process_profile(message: types.Message):
     user = get_or_create_user(message.from_user.id)
-    game_id = user["game_id"] if user["game_id"] else "Не привязан"
+    game_id = user["game_id"] if user["game_id"] else "Не указан"
+    nickname = user["nickname"] if user["nickname"] else "Не указан"
     
     text = (
         f"👤 **Профиль игрока**\n\n"
         f"🆔 Telegram ID: `{message.from_user.id}`\n"
         f"🎮 Игровой ID: `{game_id}`\n"
+        f"🏷 Никнейм: `{nickname}`\n"
         f"💰 Баланс: {user['balance']} бонусов\n"
         f"👥 Приглашено друзей: {user['referrals_count']}"
     )
     await message.answer(text, parse_mode="Markdown")
 
-# 🎮 Привязка аккаунта
+# 🎮 Привязка аккаунта (Шаг 1: Ввод ID)
 @dp.message(F.text == "🎮 Привязка аккаунта")
-async def process_bind_game(message: types.Message, state: FSMContext):
-    await state.set_state(Form.bind_game_account)
-    await message.answer("🎮 Отправьте ваш игровой ID или никнейм для привязки:")
+async def process_bind_start(message: types.Message, state: FSMContext):
+    await state.set_state(Form.bind_game_id)
+    await message.answer("🎮 Шаг 1/2: Введите ваш **Игровой ID**:", parse_mode="Markdown")
 
-@dp.message(Form.bind_game_account)
-async def process_game_account_input(message: types.Message, state: FSMContext):
+# 🎮 Привязка аккаунта (Шаг 2: Ввод Никнейма)
+@dp.message(Form.bind_game_id)
+async def process_bind_game_id(message: types.Message, state: FSMContext):
+    await state.update_data(game_id=message.text)
+    await state.set_state(Form.bind_nickname)
+    await message.answer("🏷 Шаг 2/2: Введите ваш **Игровой Никнейм**:", parse_mode="Markdown")
+
+@dp.message(Form.bind_nickname)
+async def process_bind_nickname(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    game_id = data["game_id"]
+    nickname = message.text
+    
     user = get_or_create_user(message.from_user.id)
-    user["game_id"] = message.text
+    user["game_id"] = game_id
+    user["nickname"] = nickname
+    
     await state.clear()
     await message.answer(
-        f"✅ Игровой аккаунт `{message.text}` успешно привязан!",
+        f"✅ Аккаунт успешно привязан!\n\n"
+        f"🆔 Игровой ID: `{game_id}`\n"
+        f"🏷 Никнейм: `{nickname}`",
         parse_mode="Markdown",
         reply_markup=get_main_keyboard(message.from_user.id)
     )
 
-# 🔗 Рефералы
+# 🔗 Реферальная система
 @dp.message(F.text == "🔗 Рефералы")
 async def process_ref_system(message: types.Message):
     bot_info = await bot.get_me()
@@ -162,8 +186,7 @@ async def process_ref_system(message: types.Message):
     
     text = (
         f"🔗 **Реферальная система**\n\n"
-        f"Приглашайте друзей по вашей ссылке и получайте бонусы!\n\n"
-        f"Ваша ссылка:\n`{ref_link}`\n\n"
+        f"Ваша пригласительная ссылка:\n`{ref_link}`\n\n"
         f"👥 Вы пригласили: {user['referrals_count']} чел."
     )
     await message.answer(text, parse_mode="Markdown")
@@ -195,7 +218,7 @@ async def process_admin_panel(message: types.Message):
     )
 
 # -------------------------------------------------------------------
-# АДМИН-ФУНКЦИИ (CALLBACKS & STATES)
+# АДМИН-ФУНКЦИИ
 # -------------------------------------------------------------------
 
 # Выдача бонуса
@@ -234,41 +257,77 @@ async def admin_give_bonus_amount(message: types.Message, state: FSMContext):
 
     await message.answer(f"✅ Пользователю `{target_id}` начислено {amount} бонусов.", parse_mode="Markdown")
 
-# Забанить
+# Бан
 @dp.callback_query(F.data == "admin_ban")
 async def admin_ban_start(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id not in ADMIN_IDS: return
     await state.set_state(Form.admin_ban_id)
-    await callback.message.answer("Введите Telegram ID пользователя для забана:")
+    await callback.message.answer("Введите Telegram ID для забана:")
     await callback.answer()
 
 @dp.message(Form.admin_ban_id)
 async def admin_ban_process(message: types.Message, state: FSMContext):
-    if not message.text.isdigit():
-        return await message.answer("ID должен состоять из цифр!")
-    
+    if not message.text.isdigit(): return await message.answer("ID должен состоять из цифр!")
     target_id = int(message.text)
     db["banned"].add(target_id)
     await state.clear()
     await message.answer(f"🚫 Пользователь `{target_id}` заблокирован.", parse_mode="Markdown")
 
-# Разбанить
+# Разбан
 @dp.callback_query(F.data == "admin_unban")
 async def admin_unban_start(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id not in ADMIN_IDS: return
     await state.set_state(Form.admin_unban_id)
-    await callback.message.answer("Введите Telegram ID пользователя для разбана:")
+    await callback.message.answer("Введите Telegram ID для разбана:")
     await callback.answer()
 
 @dp.message(Form.admin_unban_id)
 async def admin_unban_process(message: types.Message, state: FSMContext):
-    if not message.text.isdigit():
-        return await message.answer("ID должен состоять из цифр!")
-    
+    if not message.text.isdigit(): return await message.answer("ID должен состоять из цифр!")
     target_id = int(message.text)
     db["banned"].discard(target_id)
     await state.clear()
     await message.answer(f"✅ Пользователь `{target_id}` разблокирован.", parse_mode="Markdown")
+
+# Добавить админа
+@dp.callback_query(F.data == "admin_add_admin")
+async def admin_add_start(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS: return
+    await state.set_state(Form.admin_add_admin_id)
+    await callback.message.answer("Введите Telegram ID нового администратора:")
+    await callback.answer()
+
+@dp.message(Form.admin_add_admin_id)
+async def admin_add_process(message: types.Message, state: FSMContext):
+    if not message.text.isdigit(): return await message.answer("ID должен состоять из цифр!")
+    new_admin = int(message.text)
+    if new_admin not in ADMIN_IDS:
+        ADMIN_IDS.append(new_admin)
+    await state.clear()
+    await message.answer(f"👑 Пользователь `{new_admin}` добавлен в список администраторов!", parse_mode="Markdown")
+
+# Удалить админа
+@dp.callback_query(F.data == "admin_remove_admin")
+async def admin_remove_start(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id not in ADMIN_IDS: return
+    await state.set_state(Form.admin_remove_admin_id)
+    await callback.message.answer("Введите Telegram ID админа для удаления:")
+    await callback.answer()
+
+@dp.message(Form.admin_remove_admin_id)
+async def admin_remove_process(message: types.Message, state: FSMContext):
+    if not message.text.isdigit(): return await message.answer("ID должен состоять из цифр!")
+    rem_admin = int(message.text)
+    if rem_admin == 6624873620:
+        await state.clear()
+        return await message.answer("⛔ Вы не можете удалить самого себя!")
+    
+    if rem_admin in ADMIN_IDS:
+        ADMIN_IDS.remove(rem_admin)
+        await message.answer(f"🗑 Пользователь `{rem_admin}` удален из админов.", parse_mode="Markdown")
+    else:
+        await message.answer("Этот пользователь не является админом.")
+    await state.clear()
 
 # Рассылка
 @dp.callback_query(F.data == "admin_broadcast")
@@ -292,7 +351,7 @@ async def admin_broadcast_process(message: types.Message, state: FSMContext):
     await message.answer(f"📢 Рассылка завершена. Доставлено `{count}` пользователям.", parse_mode="Markdown")
 
 # -------------------------------------------------------------------
-# ВЕБ-СЕРВЕР ДЛЯ RENDER (Health Check)
+# ВЕБ-СЕРВЕР ДЛЯ RENDER
 # -------------------------------------------------------------------
 async def handle_ping(request):
     return web.Response(text="Bot is running!")
@@ -306,7 +365,7 @@ async def start_web_server():
     await site.start()
 
 # -------------------------------------------------------------------
-# ЗАПУСК БОТА
+# ЗАПУСК
 # -------------------------------------------------------------------
 async def main():
     await start_web_server()
