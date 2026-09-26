@@ -18,7 +18,8 @@ from aiohttp import web
 # -------------------------------------------------------------------
 # КОНФИГУРАЦИЯ
 # -------------------------------------------------------------------
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8877707155:AAGi6BMp6n09wQfRgLF6dxOyJ4P-4QVPkWo")
+# Новый сброшенный токен
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8877707155:AAGnObMOE9f7ejg6g3di2dpb-1Mrmje9o3k")
 
 # Список Telegram ID администраторов (Ты — главный)
 ADMIN_IDS = [6624873620]
